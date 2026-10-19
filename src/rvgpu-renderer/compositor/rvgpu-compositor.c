@@ -1057,12 +1057,45 @@ end:
 									GL_RGBA,
 									GL_UNSIGNED_BYTE,
 									shm_buffer_ptr);
+
+							GLsync upload_fence =
+								glFenceSync(
+									GL_SYNC_GPU_COMMANDS_COMPLETE,
+									0);
+							if (upload_fence ==
+							    NULL) {
+								fprintf(stderr,
+									"glFenceSync failed: error=0x%x\n",
+									glGetError());
+								glBindTexture(
+									GL_TEXTURE_2D,
+									0);
+								munmap(shm_buffer_ptr,
+								       img_w * img_h *
+									       4);
+								json_decref(
+									json_cmd_obj);
+								json_decref(
+									json_obj);
+								continue;
+							}
+
+							/* Submit the upload and fence without blocking. */
+							glFlush();
+
 							glBindTexture(
 									GL_TEXTURE_2D,
 									0);
 							munmap(shm_buffer_ptr,
 									img_w * img_h *
 									4);
+
+							json_object_set_new(
+								json_cmd_obj,
+								"upload_fence",
+								json_integer(
+									(json_int_t)(uintptr_t)
+										upload_fence));
 						}
 					}
 					json_object_set_new(
@@ -1552,6 +1585,7 @@ void compositor_render(struct compositor_params *params,
 				int scanout_id;
 				int shared_buffer_fd_index;
 				int composit_tex_id;
+				uintptr_t upload_fence_ptr = 0U;
 				json_t *json_cmd_obj = recv_json(req_read_fd);
 
 				if (json_cmd_obj) {
@@ -1642,6 +1676,16 @@ void compositor_render(struct compositor_params *params,
 							json_decref(json_cmd_obj);
 							continue;
 						}
+						json_t *json_upload_fence =
+							json_object_get(
+								json_cmd_obj,
+								"upload_fence");
+						if (json_is_integer(
+							    json_upload_fence)) {
+							upload_fence_ptr = (uintptr_t)
+								json_integer_value(
+									json_upload_fence);
+						}
 
 						pthread_mutex_lock(&surface_list_mutex);
 						json_array_foreach(rvgpu_surface_list, index,
@@ -1684,6 +1728,27 @@ void compositor_render(struct compositor_params *params,
 									json_updated_index_array,
 									json_integer(
 										shared_buffer_fd_index));
+								json_t *json_previous_fence =
+									json_object_get(
+										value,
+										"upload_fence");
+								if (json_is_integer(
+									    json_previous_fence)) {
+									GLsync previous_fence =
+										(GLsync)(uintptr_t)json_integer_value(
+											json_previous_fence);
+									if (previous_fence !=
+									    NULL) {
+										glDeleteSync(
+											previous_fence);
+									}
+								}
+								json_object_set_new(
+									value,
+									"upload_fence",
+									json_integer(
+										(json_int_t)
+											upload_fence_ptr));
 								break;
 							} //target surface
 						} //rvgpu surface for loop
@@ -1932,6 +1997,7 @@ void compositor_render(struct compositor_params *params,
 				int composit_tex_id;
 				int img_w, img_h;
 				GLuint texture_id;
+				GLsync upload_fence = NULL;
 				pthread_mutex_lock(&surface_list_mutex);
 				json_array_foreach(rvgpu_surface_list, index,
 						   value)
@@ -1979,7 +2045,21 @@ void compositor_render(struct compositor_params *params,
 						    -1) {
 							continue;
 						}
-						texture_id = (GLuint) composit_tex_id;
+						texture_id =
+							(GLuint)composit_tex_id;
+						json_t *json_upload_fence =
+							json_object_get(
+								value,
+								"upload_fence");
+						if (json_is_integer(
+							    json_upload_fence)) {
+							upload_fence = (GLsync)(uintptr_t)
+								json_integer_value(
+									json_upload_fence);
+						}
+						json_object_set_new(
+							value, "upload_fence",
+							json_integer(0));
 						need_draw = 1;
 #if 0
 						printf("Draw JSON Object %zu: %s\n", index, json_dumps(value, 0));
@@ -2058,6 +2138,12 @@ void compositor_render(struct compositor_params *params,
 						src_w = img_w;
 						src_h = img_h;
 					}
+					if (upload_fence != NULL) {
+						glWaitSync(upload_fence, 0,
+							   GL_TIMEOUT_IGNORED);
+						glDeleteSync(upload_fence);
+						upload_fence = NULL;
+					}
 					draw_2d_texture_layout(
 						texture_id, img_w, img_h, src_x,
 						src_y, src_w, src_h, dst_x,
@@ -2088,6 +2174,21 @@ void compositor_render(struct compositor_params *params,
 				if (get_int_from_jsonobj(value, "height",
 							 &img_h) == -1) {
 					continue;
+				}
+				GLsync upload_fence = NULL;
+				json_t *json_upload_fence =
+					json_object_get(value, "upload_fence");
+				if (json_is_integer(json_upload_fence)) {
+					upload_fence = (GLsync)(uintptr_t)
+						json_integer_value(
+							json_upload_fence);
+				}
+				json_object_set_new(value, "upload_fence",
+						    json_integer(0));
+				if (upload_fence != NULL) {
+					glWaitSync(upload_fence, 0,
+						   GL_TIMEOUT_IGNORED);
+					glDeleteSync(upload_fence);
 				}
 				draw_2d_texture_layout((GLuint)composit_tex_id, img_w, img_h,
 						       0, 0, img_w, img_h, 0, 0,
